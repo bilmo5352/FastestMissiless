@@ -1346,8 +1346,9 @@ async def process_url(
                 error_msg = str(e)[:500]
                 success = False
                 status.update({"stage": "exception", "ok": False, "err": error_msg, "elapsed": time.time()-ts0})
-                manifest_fh.write(json.dumps(status, default=str) + "\n")
-                manifest_fh.flush()
+                if manifest_fh:
+                    manifest_fh.write(json.dumps(status, default=str) + "\n")
+                    manifest_fh.flush()
                 logging.exception("process_url exception")
                 
                 # Update database
