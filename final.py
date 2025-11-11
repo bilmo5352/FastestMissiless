@@ -48,14 +48,23 @@ except ImportError:
     logging.warning("supabase-py not installed. Products will not be saved to database")
 
 # -------------------- CONFIG --------------------
-OUT_DIR = Path("outFinal")
+# Output directory (configurable via env var, defaults to temp in production)
+OUT_DIR_STR = os.getenv("OUT_DIR", "outFinal")
+OUT_DIR = Path(OUT_DIR_STR)
+# In production (Railway), optionally disable file saving or use temp directory
+SAVE_HTML_FILES = os.getenv("SAVE_HTML_FILES", "false").lower() == "true"
+if not SAVE_HTML_FILES:
+    # Use temp directory in production
+    import tempfile
+    OUT_DIR = Path(tempfile.gettempdir()) / "crawler_output"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
-MANIFEST_PATH = OUT_DIR / "manifest.jsonl"
+MANIFEST_PATH = OUT_DIR / "manifest.jsonl" if SAVE_HTML_FILES else None
 
-GLOBAL_CONCURRENCY = 16       # total concurrent http+heavy workers
-HEAVY_CONCURRENCY = 4         # concurrent heavy browser renders
-PER_DOMAIN_LIMIT = 3          # concurrent per-domain network fetches
-HTTP_TIMEOUT = 20             # seconds for aiohttp fast fetch
+# Concurrency settings (configurable via env vars)
+GLOBAL_CONCURRENCY = int(os.getenv("GLOBAL_CONCURRENCY", "16"))
+HEAVY_CONCURRENCY = int(os.getenv("HEAVY_CONCURRENCY", "4"))
+PER_DOMAIN_LIMIT = int(os.getenv("PER_DOMAIN_LIMIT", "3"))
+HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "20"))
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
@@ -69,18 +78,18 @@ HEAVY_EXPECTED_SELECTOR = (
     "[id^='comp-'] [class*='product'], main, body"
 )
 
-PAGE_TIMEOUT_MS = 45_000  # Increased for Wix sites
-DELAY_AFTER_WAIT = 2.0  # Increased wait for dynamic content
+PAGE_TIMEOUT_MS = int(os.getenv("PAGE_TIMEOUT_MS", "45000"))
+DELAY_AFTER_WAIT = float(os.getenv("DELAY_AFTER_WAIT", "2.0"))
 
-API_RETRY_ATTEMPTS = 3
+API_RETRY_ATTEMPTS = int(os.getenv("API_RETRY_ATTEMPTS", "3"))
 
 # Supabase configuration
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://whfjofihihlhctizchmj.supabase.co")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6IndoZmpvZmloaWhsaGN0aXpjaG1qIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjEzNzQzNDMsImV4cCI6MjA3Njk1MDM0M30.OsJnOqeJgT5REPg7uxkGmmVcHIcs5QO4vdyDi66qpR0")
 
 # Product extraction config
-EXTRACT_PRODUCTS = True       # Enable product extraction
-MAX_PRODUCTS_PER_PAGE = 50    # Maximum products to extract per page
+EXTRACT_PRODUCTS = os.getenv("EXTRACT_PRODUCTS", "true").lower() == "true"
+MAX_PRODUCTS_PER_PAGE = int(os.getenv("MAX_PRODUCTS_PER_PAGE", "50"))
 # -------------------------------------------------
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -960,12 +969,33 @@ def save_products_to_supabase(products: List[Dict[str, Any]], platform_url: str,
     return saved_count
 
 def fetch_pending_urls_from_db(limit: int = 100, worker_id: str = None) -> List[Dict[str, Any]]:
-    """Fetch pending URLs from product_page_urls table."""
+    """Fetch pending URLs from product_page_urls table.
+    
+    Also resets stuck URLs that have been in 'processing' status for too long (>30 minutes).
+    This handles cases where the script was interrupted and URLs were left in 'processing' status.
+    """
     client = get_supabase_client()
     if not client:
         return []
     
     try:
+        from datetime import datetime, timezone, timedelta
+        
+        # First, reset stuck URLs that have been processing for more than 30 minutes
+        # This handles interruptions where URLs were left in 'processing' status
+        stuck_threshold = datetime.now(timezone.utc) - timedelta(minutes=30)
+        try:
+            stuck_reset = client.table("product_page_urls").update({
+                "processing_status": "pending",
+                "claimed_by": None,
+                "claimed_at": None
+            }).eq("processing_status", "processing").lt("claimed_at", stuck_threshold.isoformat()).execute()
+            
+            if stuck_reset.data:
+                logging.info(f"[DB] Reset {len(stuck_reset.data)} stuck URLs from 'processing' to 'pending'")
+        except Exception as e:
+            logging.warning(f"[DB] Could not reset stuck URLs: {e}")
+        
         # Claim URLs by updating claimed_by and claimed_at
         query = client.table("product_page_urls").select("id, product_type_id, product_page_url").eq("processing_status", "pending").limit(limit)
         
@@ -975,7 +1005,6 @@ def fetch_pending_urls_from_db(limit: int = 100, worker_id: str = None) -> List[
         
         # Claim them by updating status to processing
         if urls and worker_id:
-            from datetime import datetime, timezone
             url_ids = [url["id"] for url in urls]
             for url_id in url_ids:
                 try:
@@ -1183,12 +1212,15 @@ async def process_url(
                 ld = extract_ld_json(html)
                 inline = extract_inline_json(html)
                 if ld or inline:
-                    save_dir = OUT_DIR / domain
-                    save_dir.mkdir(parents=True, exist_ok=True)
-                    fname = safe_filename_for_url(url)
-                    path = save_dir / fname
-                    payload = {"ld": ld, "inline": inline}
-                    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+                    if SAVE_HTML_FILES:
+                        save_dir = OUT_DIR / domain
+                        save_dir.mkdir(parents=True, exist_ok=True)
+                        fname = safe_filename_for_url(url)
+                        path = save_dir / fname
+                        payload = {"ld": ld, "inline": inline}
+                        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+                    else:
+                        path = None
 
                     products = extract_products_from_sources(html, ld, inline, final_url)
                     products_found = len(products)
@@ -1199,10 +1231,11 @@ async def process_url(
                         status["products_saved"] = products_saved
                     
                     success = products_found > 0
-                    status.update({"stage": "fast-json", "ok": success, "path": str(path), "elapsed": time.time()-ts0})
-                    manifest_fh.write(json.dumps(status, default=str) + "\n")
-                    manifest_fh.flush()
-                    logging.info(f"[FAST] {url} -> {path} ({products_found} products, {products_saved} saved)")
+                    status.update({"stage": "fast-json", "ok": success, "path": str(path) if path else None, "elapsed": time.time()-ts0})
+                    if manifest_fh:
+                        manifest_fh.write(json.dumps(status, default=str) + "\n")
+                        manifest_fh.flush()
+                    logging.info(f"[FAST] {url} -> {path if path else 'N/A'} ({products_found} products, {products_saved} saved)")
                     
                     # Update database
                     if url_id:
@@ -1215,11 +1248,14 @@ async def process_url(
                         try:
                             api_json = await fetch_json_api(session, c, referer=final_url)
                             if api_json:
-                                save_dir = OUT_DIR / domain
-                                save_dir.mkdir(parents=True, exist_ok=True)
-                                fname = safe_filename_for_url(url)
-                                path = save_dir / fname
-                                path.write_text(json.dumps({"api": api_json}, ensure_ascii=False), encoding="utf-8")
+                                if SAVE_HTML_FILES:
+                                    save_dir = OUT_DIR / domain
+                                    save_dir.mkdir(parents=True, exist_ok=True)
+                                    fname = safe_filename_for_url(url)
+                                    path = save_dir / fname
+                                    path.write_text(json.dumps({"api": api_json}, ensure_ascii=False), encoding="utf-8")
+                                else:
+                                    path = None
                                 
                                 # Try to extract products from API JSON response
                                 products = _dedupe_products(_extract_products_from_json(api_json, final_url))
@@ -1231,10 +1267,11 @@ async def process_url(
                                     status["products_saved"] = products_saved
                                 
                                 success = products_found > 0
-                                status.update({"stage": "fast-api", "api": c, "ok": success, "path": str(path), "elapsed": time.time()-ts0})
-                                manifest_fh.write(json.dumps(status, default=str) + "\n")
-                                manifest_fh.flush()
-                                logging.info(f"[API] {url} -> {path} via {c} ({products_found} products, {products_saved} saved)")
+                                status.update({"stage": "fast-api", "api": c, "ok": success, "path": str(path) if path else None, "elapsed": time.time()-ts0})
+                                if manifest_fh:
+                                    manifest_fh.write(json.dumps(status, default=str) + "\n")
+                                    manifest_fh.flush()
+                                logging.info(f"[API] {url} -> {path if path else 'N/A'} via {c} ({products_found} products, {products_saved} saved)")
                                 
                                 # Update database
                                 if url_id:
@@ -1247,20 +1284,22 @@ async def process_url(
                 expected_selector = HEAVY_EXPECTED_SELECTOR
                 res, rendered_html, screenshot = await heavy_render(url, expected_selector=expected_selector)
                 if res and getattr(res, "success", False) and rendered_html and len(rendered_html) > 1500:
-                    save_dir = OUT_DIR / domain
-                    save_dir.mkdir(parents=True, exist_ok=True)
-                    fname = safe_filename_for_url(url)
-                    path = save_dir / fname
-                    path.write_text(rendered_html, encoding="utf-8")
-                    if screenshot:
-                        try:
-                            import base64
-                            ssb = screenshot
-                            if isinstance(ssb, str):
-                                ssb = base64.b64decode(ssb)
-                            (path.with_suffix(".png")).write_bytes(ssb)
-                        except Exception:
-                            pass
+                    path = None
+                    if SAVE_HTML_FILES:
+                        save_dir = OUT_DIR / domain
+                        save_dir.mkdir(parents=True, exist_ok=True)
+                        fname = safe_filename_for_url(url)
+                        path = save_dir / fname
+                        path.write_text(rendered_html, encoding="utf-8")
+                        if screenshot:
+                            try:
+                                import base64
+                                ssb = screenshot
+                                if isinstance(ssb, str):
+                                    ssb = base64.b64decode(ssb)
+                                (path.with_suffix(".png")).write_bytes(ssb)
+                            except Exception:
+                                pass
                     
                     rendered_ld = extract_ld_json(rendered_html)
                     rendered_inline = extract_inline_json(rendered_html)
@@ -1273,25 +1312,29 @@ async def process_url(
                         status["products_saved"] = products_saved
                     
                     success = products_found > 0
-                    status.update({"stage": "heavy", "ok": success, "path": str(path), "elapsed": time.time()-ts0})
-                    manifest_fh.write(json.dumps(status, default=str) + "\n")
-                    manifest_fh.flush()
-                    logging.info(f"[HEAVY] {url} -> {path} ({products_found} products, {products_saved} saved)")
+                    path_str = str(path) if path else None
+                    status.update({"stage": "heavy", "ok": success, "path": path_str, "elapsed": time.time()-ts0})
+                    if manifest_fh:
+                        manifest_fh.write(json.dumps(status, default=str) + "\n")
+                        manifest_fh.flush()
+                    logging.info(f"[HEAVY] {url} -> {path_str if path_str else 'N/A'} ({products_found} products, {products_saved} saved)")
                     
                     # Update database
                     if url_id:
                         update_url_processing_result(url_id, success, products_found, products_saved, error_msg)
                     return
                 else:
-                    save_dir = OUT_DIR / domain
-                    save_dir.mkdir(parents=True, exist_ok=True)
-                    fname = safe_filename_for_url(url)
-                    (save_dir / ("failed_" + fname)).write_text(html[:4000], encoding="utf-8")
+                    if SAVE_HTML_FILES:
+                        save_dir = OUT_DIR / domain
+                        save_dir.mkdir(parents=True, exist_ok=True)
+                        fname = safe_filename_for_url(url)
+                        (save_dir / ("failed_" + fname)).write_text(html[:4000], encoding="utf-8")
                     error_msg = "no content or render failed"
                     success = False
                     status.update({"stage": "failed", "ok": False, "err": error_msg, "elapsed": time.time()-ts0})
-                    manifest_fh.write(json.dumps(status, default=str) + "\n")
-                    manifest_fh.flush()
+                    if manifest_fh:
+                        manifest_fh.write(json.dumps(status, default=str) + "\n")
+                        manifest_fh.flush()
                     logging.warning(f"[FAIL] {url} ({error_msg})")
                     
                     # Update database
@@ -1322,7 +1365,14 @@ async def main_from_db(batch_size: int = 100, max_batches: Optional[int] = None)
     
     connector = aiohttp.TCPConnector(ssl=_SSL_CTX, limit=GLOBAL_CONCURRENCY)
     async with aiohttp.ClientSession(connector=connector) as session:
-        with open(MANIFEST_PATH, "a", encoding="utf-8") as mf:
+        # Open manifest file only if SAVE_HTML_FILES is enabled
+        manifest_file = None
+        if MANIFEST_PATH:
+            manifest_file = open(MANIFEST_PATH, "a", encoding="utf-8")
+            mf = manifest_file
+        else:
+            mf = None
+        try:
             batch_num = 0
             total_processed = 0
             
@@ -1359,6 +1409,9 @@ async def main_from_db(batch_size: int = 100, max_batches: Optional[int] = None)
                 
                 # Small delay between batches to avoid overwhelming the database
                 await asyncio.sleep(1)
+        finally:
+            if manifest_file:
+                manifest_file.close()
     
     logging.info(f"[DB] Worker {worker_id} finished. Total URLs processed: {total_processed}")
 
@@ -1367,9 +1420,19 @@ async def main(urls):
     # Create the aiohttp connector inside the running event loop (fixes "no running event loop")
     connector = aiohttp.TCPConnector(ssl=_SSL_CTX, limit=GLOBAL_CONCURRENCY)
     async with aiohttp.ClientSession(connector=connector) as session:
-        with open(MANIFEST_PATH, "a", encoding="utf-8") as mf:
+        # Open manifest file only if SAVE_HTML_FILES is enabled
+        if MANIFEST_PATH:
+            manifest_file = open(MANIFEST_PATH, "a", encoding="utf-8")
+            mf = manifest_file
+        else:
+            manifest_file = None
+            mf = None
+        try:
             tasks = [process_url(u, session, mf) for u in urls]
             await asyncio.gather(*tasks)
+        finally:
+            if manifest_file:
+                manifest_file.close()
 
 if __name__ == "__main__":
     import sys
