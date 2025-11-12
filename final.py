@@ -61,9 +61,9 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 MANIFEST_PATH = OUT_DIR / "manifest.jsonl" if SAVE_HTML_FILES else None
 
 # Concurrency settings (configurable via env vars)
-GLOBAL_CONCURRENCY = int(os.getenv("GLOBAL_CONCURRENCY", "16"))
-HEAVY_CONCURRENCY = int(os.getenv("HEAVY_CONCURRENCY", "4"))
-PER_DOMAIN_LIMIT = int(os.getenv("PER_DOMAIN_LIMIT", "3"))
+GLOBAL_CONCURRENCY = int(os.getenv("GLOBAL_CONCURRENCY", "32"))  # Increased for 32 vCPU
+HEAVY_CONCURRENCY = int(os.getenv("HEAVY_CONCURRENCY", "8"))  # More browsers with your RAM
+PER_DOMAIN_LIMIT = int(os.getenv("PER_DOMAIN_LIMIT", "5"))
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "20"))
 
 USER_AGENTS = [
@@ -92,7 +92,14 @@ EXTRACT_PRODUCTS = os.getenv("EXTRACT_PRODUCTS", "true").lower() == "true"
 MAX_PRODUCTS_PER_PAGE = int(os.getenv("MAX_PRODUCTS_PER_PAGE", "50"))
 # -------------------------------------------------
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(
+    level=logging.INFO, 
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+# Set Crawl4AI and Playwright to DEBUG level to see what's happening
+logging.getLogger("crawl4ai").setLevel(logging.DEBUG)
+logging.getLogger("playwright").setLevel(logging.DEBUG)
 
 # Prepare SSL context using certifi (do NOT create connector here)
 _SSL_CTX = ssl.create_default_context(cafile=certifi.where())
@@ -1109,7 +1116,21 @@ async def fetch_html(session: aiohttp.ClientSession, url: str):
 
 async def heavy_render(url: str, expected_selector: str = None):
     async with heavy_sem:
-        browser_conf = BrowserConfig(headless=True)
+        # Browser config for containerized environments (security fixes, not resource limits)
+        browser_conf = BrowserConfig(
+            headless=True,
+            browser_type="chromium",
+            # Container-specific args (NOT for resource constraints)
+            extra_args=[
+                "--no-sandbox",  # Required: Docker/Railway security restriction
+                "--disable-setuid-sandbox",  # Required: Container privilege restriction
+                "--disable-dev-shm-usage",  # Required: /dev/shm limitation in containers
+                "--disable-gpu",  # No GPU in containers
+                "--disable-blink-features=AutomationControlled",  # Avoid bot detection
+                # Remove --single-process since you have 32GB RAM
+            ],
+            verbose=True,  # Enable verbose logging to see what's happening
+        )
         
         # Detect if it's a Wix site and adjust js_code accordingly
         is_wix = 'wix' in url.lower()
@@ -1149,17 +1170,23 @@ async def heavy_render(url: str, expected_selector: str = None):
             wait_for_images=True,  # Wait for images on Wix sites
             scroll_delay=0.5,  # Slower scroll for dynamic content
         )
-        async with AsyncWebCrawler(config=browser_conf) as crawler:
-            try:
-                res = await crawler.arun(url, config=run_conf)
-                html = getattr(res, "html", "") or getattr(res, "content", "") or ""
-                screenshot = getattr(res, "screenshot", None)
-                return res, html, screenshot
-            except Exception as e:
-                error_msg = str(e)
-                # If timeout on selector, try again without wait_for
-                if "timeout" in error_msg.lower() or "wait condition failed" in error_msg.lower():
-                    logging.debug(f"[HEAVY] Selector timeout for {url}, retrying without wait condition")
+        
+        logging.info(f"[HEAVY] Initializing browser for {url}")
+        try:
+            async with AsyncWebCrawler(config=browser_conf) as crawler:
+                logging.info(f"[HEAVY] Browser initialized, starting crawl for {url}")
+                try:
+                    res = await crawler.arun(url, config=run_conf)
+                    logging.info(f"[HEAVY] Crawl completed for {url}")
+                    html = getattr(res, "html", "") or getattr(res, "content", "") or ""
+                    screenshot = getattr(res, "screenshot", None)
+                    return res, html, screenshot
+                except Exception as e:
+                    error_msg = str(e)
+                    logging.error(f"[HEAVY] Crawl error for {url}: {error_msg[:200]}")
+                    # If timeout on selector, try again without wait_for
+                    if "timeout" in error_msg.lower() or "wait condition failed" in error_msg.lower():
+                        logging.info(f"[HEAVY] Selector timeout for {url}, retrying without wait condition")
                     try:
                         # Retry without wait_for - just wait for page load
                         fallback_conf = CrawlerRunConfig(
@@ -1178,11 +1205,14 @@ async def heavy_render(url: str, expected_selector: str = None):
                         screenshot = getattr(res, "screenshot", None)
                         return res, html, screenshot
                     except Exception as e2:
-                        logging.debug(f"[HEAVY] Fallback also failed for {url}: {str(e2)[:100]}")
+                        logging.error(f"[HEAVY] Fallback also failed for {url}: {str(e2)[:200]}")
                         return None, "", None
                 else:
-                    logging.debug(f"[HEAVY] Error for {url}: {error_msg[:100]}")
+                    logging.error(f"[HEAVY] Non-timeout error for {url}: {error_msg[:200]}")
                     return None, "", None
+        except Exception as browser_init_error:
+            logging.error(f"[HEAVY] Browser initialization FAILED for {url}: {str(browser_init_error)[:300]}")
+            return None, "", None
 
 # -------------------- pipeline worker --------------------
 
@@ -1376,17 +1406,29 @@ async def main_from_db(batch_size: int = 100, max_batches: Optional[int] = None)
         try:
             batch_num = 0
             total_processed = 0
+            consecutive_empty_batches = 0
+            
+            # Continuous polling mode - check for new URLs every minute when queue is empty
+            POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))  # Default: 60 seconds
             
             while True:
                 if max_batches and batch_num >= max_batches:
+                    logging.info(f"[DB] Reached max_batches limit ({max_batches}). Exiting.")
                     break
                 
                 # Fetch pending URLs from database
                 pending_urls = fetch_pending_urls_from_db(limit=batch_size, worker_id=worker_id)
                 
                 if not pending_urls:
-                    logging.info(f"[DB] No more pending URLs. Processed {total_processed} URLs total.")
-                    break
+                    consecutive_empty_batches += 1
+                    logging.info(f"[DB] No pending URLs found (attempt {consecutive_empty_batches}). "
+                                f"Waiting {POLL_INTERVAL}s before checking again...")
+                    # Wait before checking again - continuous background worker behavior
+                    await asyncio.sleep(POLL_INTERVAL)
+                    continue  # Check again instead of breaking
+                
+                # Reset empty batch counter when we find URLs
+                consecutive_empty_batches = 0
                 
                 batch_num += 1
                 logging.info(f"[DB] Batch {batch_num}: Processing {len(pending_urls)} URLs")
