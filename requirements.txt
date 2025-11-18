@@ -13,3 +13,6 @@ supabase>=2.0.0
 # Additional utilities
 lxml>=4.9.0  # For BeautifulSoup HTML parser
 
+#memory monitoring 
+psutil>=5.9.0
+
