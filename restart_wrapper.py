@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-Wrapper script that runs final.py and automatically restarts every 15 minutes.
-This ensures Railway restarts the service even if final.py silently stops.
+Enhanced restart wrapper for FastestMissiless.
+Handles adaptive crash backoff, frequent memory checks,
+incremental browser cleanup, and smart restart intervals.
 """
+
 import subprocess
 import sys
 import signal
@@ -11,36 +13,33 @@ import logging
 import os
 from datetime import datetime
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [RESTART-WRAPPER] %(levelname)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 
-# Configuration from environment
-RESTART_INTERVAL_SECONDS = int(os.getenv("RESTART_INTERVAL_MINUTES", "15")) * 60
-STARTUP_GRACE_PERIOD = 60  # Allow 60 seconds for imports
+# Config from environment with defaults
+RESTART_INTERVAL_MINUTES = int(os.getenv("RESTART_INTERVAL_MINUTES", "15"))
+RESTART_INTERVAL_SECONDS = RESTART_INTERVAL_MINUTES * 60
+STARTUP_GRACE_PERIOD = 60  # Time in sec to consider crash 'fast failure'
+MEMORY_CHECK_INTERVAL = 60  # Check memory every 60 seconds
+MEMORY_THRESHOLD_PERCENT = int(os.getenv("MEMORY_THRESHOLD", "80"))
+ORPHAN_CLEANUP_INTERVAL = 300  # 5 min interval to clean orphan browsers
+
 PROCESS = None
 consecutive_fast_failures = 0
+last_orphan_cleanup = 0
 
 def get_memory_usage():
-    """Get current memory usage percentage."""
     try:
         import psutil
         return psutil.virtual_memory().percent
     except ImportError:
-        logging.warning("psutil not installed, cannot monitor memory")
+        logging.warning("psutil not installed, memory monitoring disabled")
         return 0
 
-def signal_handler(sig, frame):
-    """Handle termination signals gracefully."""
-    logging.info("Received termination signal, shutting down...")
-    cleanup_process()
-    sys.exit(0)
-
 def cleanup_process():
-    """Terminate and cleanup the subprocess."""
     global PROCESS
     if PROCESS and PROCESS.poll() is None:
         logging.info("Terminating final.py process...")
@@ -49,12 +48,13 @@ def cleanup_process():
             PROCESS.wait(timeout=15)
             logging.info("Process terminated gracefully")
         except subprocess.TimeoutExpired:
-            logging.warning("Process didn't terminate, killing...")
+            logging.warning("Process did not terminate after timeout, killing...")
             PROCESS.kill()
             PROCESS.wait()
             logging.info("Process killed")
-    
-    # Kill any orphaned browser processes
+    time.sleep(2)  # Wait for OS cleanup
+
+    # Kill orphaned browser processes incrementally
     try:
         subprocess.run(["pkill", "-9", "chromium"], stderr=subprocess.DEVNULL)
         subprocess.run(["pkill", "-9", "chrome"], stderr=subprocess.DEVNULL)
@@ -62,144 +62,102 @@ def cleanup_process():
     except Exception as e:
         logging.warning(f"Could not kill browser processes: {e}")
 
+def signal_handler(sig, frame):
+    logging.info("Received termination signal, shutting down...")
+    cleanup_process()
+    sys.exit(0)
+
 def main():
-    """Main wrapper function."""
-    global PROCESS, consecutive_fast_failures
-    
-    # Register signal handlers
+    global PROCESS, consecutive_fast_failures, last_orphan_cleanup
+
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
-    
-    # Get command to run
+
     cmd = sys.argv[1:] if len(sys.argv) > 1 else [
         "python", "final.py", "--db", "--batch-size", "100"
     ]
-    
+
     cycle = 1
-    
+    last_memory_check = 0
+    start_time = 0
+
     while True:
         start_time = time.time()
-        
-        logging.info("=" * 80)
+        logging.info("="*80)
         logging.info(f"Starting cycle #{cycle} at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         logging.info(f"Command: {' '.join(cmd)}")
-        logging.info(f"Will restart after {RESTART_INTERVAL_SECONDS / 60:.0f} minutes")
-        logging.info(f"Memory usage: {get_memory_usage():.1f}%")
-        logging.info("=" * 80)
-        
-        try:
-            # Set environment variables for this process
-            env = os.environ.copy()
-            env.update({
-                'OPENBLAS_NUM_THREADS': '4',
-                'OMP_NUM_THREADS': '4',
-                'MKL_NUM_THREADS': '4',
-                'NUMEXPR_NUM_THREADS': '4',
-            })
-            
-            # Start the process
-            PROCESS = subprocess.Popen(
-                cmd,
-                stdout=sys.stdout,
-                stderr=sys.stderr,
-                bufsize=1,
-                universal_newlines=True,
-                env=env
-            )
-            
-            # Monitor the process
-            elapsed = 0
-            last_log_time = 0
-            
-            while elapsed < RESTART_INTERVAL_SECONDS:
-                # Check if process is still running
-                if PROCESS.poll() is not None:
-                    # Process exited
-                    exit_code = PROCESS.returncode
-                    elapsed = time.time() - start_time
-                    
-                    # Check if this was a fast failure (within startup grace period)
-                    if elapsed < STARTUP_GRACE_PERIOD:
-                        consecutive_fast_failures += 1
-                        logging.error(
-                            f"Process crashed during startup with code {exit_code} "
-                            f"after {elapsed:.1f} seconds "
-                            f"(failure #{consecutive_fast_failures})"
-                        )
-                        
-                        # If too many fast failures, wait longer before retry
-                        if consecutive_fast_failures >= 3:
-                            wait_time = min(60, consecutive_fast_failures * 10)
-                            logging.warning(
-                                f"Multiple fast failures detected. "
-                                f"Waiting {wait_time} seconds before retry..."
-                            )
-                            time.sleep(wait_time)
-                        else:
-                            time.sleep(5)
-                    else:
-                        # Process ran for a while before exiting
-                        consecutive_fast_failures = 0
-                        logging.info(
-                            f"Process exited with code {exit_code} "
-                            f"after {elapsed:.1f} seconds"
-                        )
-                        time.sleep(5)
-                    
+        logging.info(f"Will restart after {RESTART_INTERVAL_MINUTES} minutes")
+        logging.info(f"Initial memory usage: {get_memory_usage():.1f}%")
+        logging.info("="*80)
+
+        env = os.environ.copy()
+        env.update({
+            'OPENBLAS_NUM_THREADS': '4',
+            'OMP_NUM_THREADS': '4',
+            'MKL_NUM_THREADS': '4',
+            'NUMEXPR_NUM_THREADS': '4',
+        })
+
+        PROCESS = subprocess.Popen(
+            cmd,
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+            bufsize=1,
+            universal_newlines=True,
+            env=env
+        )
+
+        while True:
+            elapsed = time.time() - start_time
+
+            if PROCESS.poll() is not None:
+                exit_code = PROCESS.returncode
+                if elapsed < STARTUP_GRACE_PERIOD:
+                    consecutive_fast_failures += 1
+                    logging.error(f"Process crashed during startup, exit code {exit_code}, failure #{consecutive_fast_failures}")
+                    backoff = min(60, 10 * (2 ** (consecutive_fast_failures - 1)))  # Exponential backoff: 10s, 20s, 40s, max 60s
+                    logging.info(f"Sleeping for {backoff} seconds before restart")
+                    time.sleep(backoff)
+                else:
+                    consecutive_fast_failures = 0
+                    logging.info(f"Process exited with code {exit_code} after {elapsed:.1f} seconds. Restarting shortly.")
+                    time.sleep(5)
+                break
+
+            current_time = time.time()
+
+            # Periodic memory check
+            if current_time - last_memory_check > MEMORY_CHECK_INTERVAL:
+                mem = get_memory_usage()
+                logging.info(f"Memory usage: {mem:.1f}% at {elapsed/60:.1f} min elapsed")
+                last_memory_check = current_time
+                if mem > MEMORY_THRESHOLD_PERCENT:
+                    logging.warning(f"Memory usage exceeded threshold ({mem:.1f}%). Restarting early.")
+                    cleanup_process()
                     break
-                
-                # Sleep in small increments
-                time.sleep(5)
-                elapsed = time.time() - start_time
-                
-                # Log progress every 5 minutes
-                if elapsed - last_log_time >= 300:
-                    remaining = RESTART_INTERVAL_SECONDS - elapsed
-                    mem = get_memory_usage()
-                    logging.info(
-                        f"Running... {elapsed/60:.1f} min elapsed, "
-                        f"{remaining/60:.1f} min until restart, "
-                        f"memory: {mem:.1f}%"
-                    )
-                    last_log_time = elapsed
-                    
-                    # Check memory threshold
-                    if mem > 85:
-                        logging.warning(
-                            f"Memory usage high ({mem:.1f}%), "
-                            "triggering early restart..."
-                        )
-                        break
-            
-            # If we reached the timeout, terminate the process
-            if PROCESS.poll() is None:
-                elapsed = time.time() - start_time
-                logging.info(
-                    f"Reached {RESTART_INTERVAL_SECONDS / 60:.0f} minute timeout "
-                    f"(elapsed: {elapsed/60:.1f} min)"
-                )
+
+            # Periodic orphan cleanup
+            if current_time - last_orphan_cleanup > ORPHAN_CLEANUP_INTERVAL:
+                logging.info("Running periodic orphan browser cleanup.")
+                try:
+                    subprocess.run(["pkill", "-9", "chromium"], stderr=subprocess.DEVNULL)
+                    subprocess.run(["pkill", "-9", "chrome"], stderr=subprocess.DEVNULL)
+                    logging.info("Orphaned browsers cleaned up")
+                except Exception as e:
+                    logging.warning(f"Failed to clean orphans: {e}")
+                last_orphan_cleanup = current_time
+
+            # Restart after timeout
+            if elapsed > RESTART_INTERVAL_SECONDS:
+                logging.info(f"Reached {RESTART_INTERVAL_MINUTES} minutes timeout (elapsed: {elapsed / 60:.1f} min)")
                 cleanup_process()
-            
-            # Reset consecutive failures if we ran successfully
-            if elapsed >= STARTUP_GRACE_PERIOD:
-                consecutive_fast_failures = 0
-            
-            # Log cycle completion
-            logging.info(f"Cycle #{cycle} completed. Restarting in 5 seconds...")
+                break
+
             time.sleep(5)
-            cycle += 1
-            
-        except KeyboardInterrupt:
-            logging.info("Received keyboard interrupt, shutting down...")
-            cleanup_process()
-            sys.exit(0)
-            
-        except Exception as e:
-            logging.error(f"Error in wrapper: {e}", exc_info=True)
-            cleanup_process()
-            logging.info("Restarting in 10 seconds...")
-            time.sleep(10)
-            cycle += 1
+
+        logging.info(f"Cycle #{cycle} complete. Restarting in 5 seconds...")
+        time.sleep(5)
+        cycle += 1
 
 if __name__ == "__main__":
     main()
