@@ -92,10 +92,12 @@ def main():
 
         env = os.environ.copy()
         env.update({
-            'OPENBLAS_NUM_THREADS': '4',
-            'OMP_NUM_THREADS': '4',
-            'MKL_NUM_THREADS': '4',
-            'NUMEXPR_NUM_THREADS': '4',
+             "OPENBLAS_NUM_THREADS": "1",
+             "OMP_NUM_THREADS": "1",
+             "MKL_NUM_THREADS": "1",
+             "NUMEXPR_NUM_THREADS": "1",
+             "BLIS_NUM_THREADS": "1",
+             "MALLOC_ARENA_MAX": "2",
         })
 
         PROCESS = subprocess.Popen(
