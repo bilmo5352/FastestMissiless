@@ -10,6 +10,9 @@ import hashlib
 import logging
 import os
 import sys
+import uuid
+import gc
+import tempfile
 from pathlib import Path
 from urllib.parse import urlparse, urljoin
 from collections import defaultdict
@@ -28,6 +31,7 @@ if sys.platform == "win32":
 import aiohttp
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from bs4 import BeautifulSoup
+import psutil
 
 from crawl4ai import (
     AsyncWebCrawler,
@@ -95,6 +99,10 @@ MAX_PRODUCTS_PER_PAGE = int(os.getenv("MAX_PRODUCTS_PER_PAGE", "50"))
 # Watchdog/Timeout config for health checks
 ACTIVITY_TIMEOUT_SECONDS = int(os.getenv("ACTIVITY_TIMEOUT_SECONDS", "300"))  # 5 minutes default
 HEAVY_RENDER_TIMEOUT = int(os.getenv("HEAVY_RENDER_TIMEOUT", "120"))  # 2 minutes per URL
+
+# Memory and thread limits for graceful exit
+MEMORY_LIMIT_BYTES = int(os.getenv("MEMORY_LIMIT_BYTES", str(1800 * 1024 * 1024)))  # e.g. 1.8GB
+THREAD_LIMIT = int(os.getenv("THREAD_LIMIT", "400"))  # tune as needed
 # -------------------------------------------------
 
 logging.basicConfig(
@@ -128,6 +136,24 @@ def check_activity_timeout():
         logging.error(f"[WATCHDOG] No activity for {inactive_seconds:.0f}s (limit: {ACTIVITY_TIMEOUT_SECONDS}s). Forcing restart...")
         sys.exit(1)  # Exit with error code to trigger restart
 
+def check_limits():
+    """Check memory and thread limits, exit gracefully if exceeded."""
+    try:
+        p = psutil.Process()
+        rss = p.memory_info().rss
+        threads = p.num_threads()
+        
+        if rss >= MEMORY_LIMIT_BYTES:
+            logging.error(f"[LIMITS] RSS {rss / (1024*1024):.1f}MB >= limit {MEMORY_LIMIT_BYTES / (1024*1024):.1f}MB. Exiting for restart.")
+            sys.exit(1)
+        
+        if threads >= THREAD_LIMIT:
+            logging.error(f"[LIMITS] Thread count {threads} >= limit {THREAD_LIMIT}. Exiting for restart.")
+            sys.exit(1)
+    except Exception as e:
+        logging.warning(f"[LIMITS] Error checking limits: {e}")
+        # Don't exit on error checking limits, just log it
+
 def get_supabase_client() -> Optional[Any]:
     global _supabase_client
     if not SUPABASE_AVAILABLE or not SUPABASE_KEY:
@@ -145,6 +171,10 @@ def get_supabase_client() -> Optional[Any]:
 domain_locks = defaultdict(lambda: asyncio.Semaphore(PER_DOMAIN_LIMIT))
 global_sem = asyncio.Semaphore(GLOBAL_CONCURRENCY)
 heavy_sem = asyncio.Semaphore(HEAVY_CONCURRENCY)
+
+# Browser pool for reusing browser instances
+_browser_pool: Optional[asyncio.Queue] = None
+_browser_pool_initialized = False
 
 # -------------------- helpers --------------------
 
@@ -1135,128 +1165,224 @@ async def fetch_html(session: aiohttp.ClientSession, url: str):
 
 # -------------------- heavy render via Crawl4AI --------------------
 
-async def heavy_render(url: str, expected_selector: str = None):
-    async with heavy_sem:
-        # Browser config for containerized environments (security fixes, not resource limits)
-        browser_conf = BrowserConfig(
-            headless=True,
-            browser_type="chromium",
-            # Container-specific args (NOT for resource constraints)
-            extra_args=[
-                "--no-sandbox",  # Required: Docker/Railway security restriction
-                "--disable-setuid-sandbox",  # Required: Container privilege restriction
-                "--disable-dev-shm-usage",  # Required: /dev/shm limitation in containers
-                "--disable-gpu",  # No GPU in containers
-                "--disable-blink-features=AutomationControlled",  # Avoid bot detection
-                # Remove --single-process since you have 32GB RAM
-            ],
-            verbose=True,  # Enable verbose logging to see what's happening
-        )
-        
-        # Detect if it's a Wix site and adjust js_code accordingly
-        is_wix = 'wix' in url.lower()
-        
-        js_scroll = [
-            # Slow progressive scroll
-            "(()=>{window.scrollTo({top: document.body.scrollHeight/4, behavior: 'smooth'});return true})()",
-            "(()=>{window.scrollTo({top: document.body.scrollHeight/2, behavior: 'smooth'});return true})()",
-            "(()=>{window.scrollTo({top: document.body.scrollHeight, behavior: 'smooth'});return true})()",
-        ]
-        
-        if is_wix:
-            # Additional Wix-specific JavaScript to trigger lazy loading
-            js_scroll.extend([
-                # Trigger Wix lazy load events
-                "(()=>{window.dispatchEvent(new Event('scroll'));return true})()",
-                "(()=>{window.dispatchEvent(new Event('resize'));return true})()",
-            ])
-        
-        # Clean up selector - remove empty selectors that cause timeout errors
-        clean_selector = None
-        if expected_selector:
-            # Remove empty selectors (caused by trailing commas)
-            parts = [s.strip() for s in expected_selector.split(',') if s.strip()]
-            if parts:
-                clean_selector = ', '.join(parts)
-        
-        # Try with wait_for first, but fallback to no wait if it fails
-        run_conf = CrawlerRunConfig(
-            cache_mode=CacheMode.BYPASS,
-            stream=False,
-            wait_for=(f"css:{clean_selector}" if clean_selector else None),
-            js_code=js_scroll,
-            page_timeout=PAGE_TIMEOUT_MS,
-            delay_before_return_html=DELAY_AFTER_WAIT,
-            scan_full_page=True,  # Enable full page scan for Wix
-            wait_for_images=True,  # Wait for images on Wix sites
-            scroll_delay=0.5,  # Slower scroll for dynamic content
-        )
-        
-        logging.info(f"[HEAVY] Initializing browser for {url}")
+def _get_browser_config():
+    """Get browser configuration for containerized environments."""
+    return BrowserConfig(
+        headless=True,
+        browser_type="chromium",
+        # Container-specific args (NOT for resource constraints)
+        extra_args=[
+            "--no-sandbox",  # Required: Docker/Railway security restriction
+            "--disable-setuid-sandbox",  # Required: Container privilege restriction
+            "--disable-dev-shm-usage",  # Required: /dev/shm limitation in containers
+            "--disable-gpu",  # No GPU in containers
+            "--disable-blink-features=AutomationControlled",  # Avoid bot detection
+        ],
+        verbose=True,  # Enable verbose logging to see what's happening
+    )
+
+async def _init_browser_pool():
+    """Initialize browser pool with HEAVY_CONCURRENCY browsers."""
+    global _browser_pool, _browser_pool_initialized
+    if _browser_pool_initialized:
+        return
+    
+    _browser_pool = asyncio.Queue(maxsize=HEAVY_CONCURRENCY)
+    browser_conf = _get_browser_config()
+    
+    logging.info(f"[BROWSER_POOL] Initializing {HEAVY_CONCURRENCY} browser instances...")
+    for i in range(HEAVY_CONCURRENCY):
         try:
-            async with AsyncWebCrawler(config=browser_conf) as crawler:
-                update_activity()  # Update after browser init
-                logging.info(f"[HEAVY] Browser initialized, starting crawl for {url}")
-                
-                try:
-                    # Add timeout wrapper to prevent hanging
-                    res = await asyncio.wait_for(
-                        crawler.arun(url, config=run_conf),
-                        timeout=HEAVY_RENDER_TIMEOUT
-                    )
-                    update_activity()  # Update after successful crawl
-                    logging.info(f"[HEAVY] Crawl completed for {url}")
-                    html = getattr(res, "html", "") or getattr(res, "content", "") or ""
-                    screenshot = getattr(res, "screenshot", None)
-                    return res, html, screenshot
-                except asyncio.TimeoutError:
-                    update_activity()  # Update even on timeout
-                    logging.error(f"[HEAVY] Crawl TIMEOUT after {HEAVY_RENDER_TIMEOUT}s for {url}")
-                    return None, "", None
-                except Exception as e:
-                    update_activity()  # Update even on error
-                    error_msg = str(e)
-                    logging.error(f"[HEAVY] Crawl error for {url}: {error_msg[:200]}")
-                    # If timeout on selector, try again without wait_for
-                    if "timeout" in error_msg.lower() or "wait condition failed" in error_msg.lower():
-                        logging.info(f"[HEAVY] Selector timeout for {url}, retrying without wait condition")
-                    try:
-                        update_activity()  # Update before retry
-                        # Retry without wait_for - just wait for page load
-                        fallback_conf = CrawlerRunConfig(
-                            cache_mode=CacheMode.BYPASS,
-                            stream=False,
-                            wait_for=None,  # No selector wait
-                            js_code=js_scroll,
-                            page_timeout=PAGE_TIMEOUT_MS,
-                            delay_before_return_html=DELAY_AFTER_WAIT,
-                            scan_full_page=True,
-                            wait_for_images=False,  # Don't wait for images on retry
-                            scroll_delay=0.5,
-                        )
-                        res = await asyncio.wait_for(
-                            crawler.arun(url, config=fallback_conf),
-                            timeout=HEAVY_RENDER_TIMEOUT
-                        )
-                        update_activity()  # Update after retry
-                        html = getattr(res, "html", "") or getattr(res, "content", "") or ""
-                        screenshot = getattr(res, "screenshot", None)
-                        return res, html, screenshot
-                    except asyncio.TimeoutError:
-                        update_activity()
-                        logging.error(f"[HEAVY] Fallback also TIMEOUT for {url}")
-                        return None, "", None
-                    except Exception as e2:
-                        update_activity()
-                        logging.error(f"[HEAVY] Fallback also failed for {url}: {str(e2)[:200]}")
-                        return None, "", None
-                else:
-                    logging.error(f"[HEAVY] Non-timeout error for {url}: {error_msg[:200]}")
-                    return None, "", None
+            crawler = AsyncWebCrawler(config=browser_conf)
+            await crawler.__aenter__()  # Initialize the browser
+            await _browser_pool.put(crawler)
+            logging.info(f"[BROWSER_POOL] Browser {i+1}/{HEAVY_CONCURRENCY} initialized")
+        except Exception as e:
+            logging.error(f"[BROWSER_POOL] Failed to initialize browser {i+1}: {e}")
+            # Continue with fewer browsers if some fail
+    
+    _browser_pool_initialized = True
+    logging.info(f"[BROWSER_POOL] Browser pool initialized with {_browser_pool.qsize()} browsers")
+
+async def _cleanup_browser_pool():
+    """Clean up all browsers in the pool."""
+    global _browser_pool, _browser_pool_initialized
+    if not _browser_pool_initialized or not _browser_pool:
+        return
+    
+    logging.info("[BROWSER_POOL] Cleaning up browser pool...")
+    count = 0
+    while not _browser_pool.empty():
+        try:
+            crawler = await _browser_pool.get()
+            await crawler.__aexit__(None, None, None)  # Cleanup the browser
+            count += 1
+        except Exception as e:
+            logging.warning(f"[BROWSER_POOL] Error cleaning up browser: {e}")
+    
+    _browser_pool_initialized = False
+    logging.info(f"[BROWSER_POOL] Cleaned up {count} browsers")
+
+async def heavy_render(url: str, expected_selector: str = None):
+    # Check limits before heavy browser work
+    check_limits()
+    
+    async with heavy_sem:
+        # Get browser from pool (reuse existing instance)
+        crawler = None
+        try:
+            if _browser_pool_initialized and _browser_pool:
+                crawler = await _browser_pool.get()
+                logging.info(f"[HEAVY] Reusing browser for {url}")
+            else:
+                # Fallback: create new browser if pool not initialized
+                browser_conf = _get_browser_config()
+                crawler = AsyncWebCrawler(config=browser_conf)
+                await crawler.__aenter__()
+                logging.info(f"[HEAVY] Created new browser for {url} (pool not available)")
         except Exception as browser_init_error:
             update_activity()
             logging.error(f"[HEAVY] Browser initialization FAILED for {url}: {str(browser_init_error)[:300]}")
             return None, "", None
+        
+        try:
+            # Detect if it's a Wix site and adjust js_code accordingly
+            is_wix = 'wix' in url.lower()
+            
+            js_scroll = [
+                # Slow progressive scroll
+                "(()=>{window.scrollTo({top: document.body.scrollHeight/4, behavior: 'smooth'});return true})()",
+                "(()=>{window.scrollTo({top: document.body.scrollHeight/2, behavior: 'smooth'});return true})()",
+                "(()=>{window.scrollTo({top: document.body.scrollHeight, behavior: 'smooth'});return true})()",
+            ]
+            
+            if is_wix:
+                # Additional Wix-specific JavaScript to trigger lazy loading
+                js_scroll.extend([
+                    # Trigger Wix lazy load events
+                    "(()=>{window.dispatchEvent(new Event('scroll'));return true})()",
+                    "(()=>{window.dispatchEvent(new Event('resize'));return true})()",
+                ])
+            
+            # Clean up selector - remove empty selectors that cause timeout errors
+            clean_selector = None
+            if expected_selector:
+                # Remove empty selectors (caused by trailing commas)
+                parts = [s.strip() for s in expected_selector.split(',') if s.strip()]
+                if parts:
+                    clean_selector = ', '.join(parts)
+            
+            # Try with wait_for first, but fallback to no wait if it fails
+            run_conf = CrawlerRunConfig(
+                cache_mode=CacheMode.BYPASS,
+                stream=False,
+                wait_for=(f"css:{clean_selector}" if clean_selector else None),
+                js_code=js_scroll,
+                page_timeout=PAGE_TIMEOUT_MS,
+                delay_before_return_html=DELAY_AFTER_WAIT,
+                scan_full_page=True,  # Enable full page scan for Wix
+                wait_for_images=True,  # Wait for images on Wix sites
+                scroll_delay=0.5,  # Slower scroll for dynamic content
+            )
+            
+            update_activity()  # Update before crawl
+            logging.info(f"[HEAVY] Starting crawl for {url}")
+            
+            try:
+                # Add timeout wrapper to prevent hanging
+                res = await asyncio.wait_for(
+                    crawler.arun(url, config=run_conf),
+                    timeout=HEAVY_RENDER_TIMEOUT
+                )
+                update_activity()  # Update after successful crawl
+                logging.info(f"[HEAVY] Crawl completed for {url}")
+                html = getattr(res, "html", "") or getattr(res, "content", "") or ""
+                screenshot_path = None
+                screenshot = getattr(res, "screenshot", None)
+                if screenshot:
+                    try:
+                        # Save screenshot to temp file instead of keeping in memory
+                        temp_dir = tempfile.gettempdir()
+                        screenshot_path = os.path.join(temp_dir, f"{uuid.uuid4().hex}.png")
+                        ssb = screenshot
+                        if isinstance(ssb, str):
+                            import base64
+                            ssb = base64.b64decode(ssb)
+                        with open(screenshot_path, "wb") as f:
+                            f.write(ssb)
+                        logging.debug(f"[HEAVY] Screenshot saved to temp file: {screenshot_path}")
+                    except Exception as e:
+                        logging.warning(f"[HEAVY] Failed to save screenshot to temp file: {e}")
+                        screenshot_path = None
+                return res, html, screenshot_path
+            except asyncio.TimeoutError:
+                update_activity()  # Update even on timeout
+                logging.error(f"[HEAVY] Crawl TIMEOUT after {HEAVY_RENDER_TIMEOUT}s for {url}")
+                return None, "", None
+            except Exception as e:
+                update_activity()  # Update even on error
+                error_msg = str(e)
+                logging.error(f"[HEAVY] Crawl error for {url}: {error_msg[:200]}")
+                # If timeout on selector, try again without wait_for
+                if "timeout" in error_msg.lower() or "wait condition failed" in error_msg.lower():
+                    logging.info(f"[HEAVY] Selector timeout for {url}, retrying without wait condition")
+                try:
+                    update_activity()  # Update before retry
+                    # Retry without wait_for - just wait for page load
+                    fallback_conf = CrawlerRunConfig(
+                        cache_mode=CacheMode.BYPASS,
+                        stream=False,
+                        wait_for=None,  # No selector wait
+                        js_code=js_scroll,
+                        page_timeout=PAGE_TIMEOUT_MS,
+                        delay_before_return_html=DELAY_AFTER_WAIT,
+                        scan_full_page=True,
+                        wait_for_images=False,  # Don't wait for images on retry
+                        scroll_delay=0.5,
+                    )
+                    res = await asyncio.wait_for(
+                        crawler.arun(url, config=fallback_conf),
+                        timeout=HEAVY_RENDER_TIMEOUT
+                    )
+                    update_activity()  # Update after retry
+                    html = getattr(res, "html", "") or getattr(res, "content", "") or ""
+                    screenshot_path = None
+                    screenshot = getattr(res, "screenshot", None)
+                    if screenshot:
+                        try:
+                            # Save screenshot to temp file instead of keeping in memory
+                            temp_dir = tempfile.gettempdir()
+                            screenshot_path = os.path.join(temp_dir, f"{uuid.uuid4().hex}.png")
+                            ssb = screenshot
+                            if isinstance(ssb, str):
+                                import base64
+                                ssb = base64.b64decode(ssb)
+                            with open(screenshot_path, "wb") as f:
+                                f.write(ssb)
+                            logging.debug(f"[HEAVY] Screenshot saved to temp file: {screenshot_path}")
+                        except Exception as e:
+                            logging.warning(f"[HEAVY] Failed to save screenshot to temp file: {e}")
+                            screenshot_path = None
+                    return res, html, screenshot_path
+                except asyncio.TimeoutError:
+                    update_activity()
+                    logging.error(f"[HEAVY] Fallback also TIMEOUT for {url}")
+                    return None, "", None
+                except Exception as e2:
+                    update_activity()
+                    logging.error(f"[HEAVY] Fallback also failed for {url}: {str(e2)[:200]}")
+                    return None, "", None
+        finally:
+            # Return browser to pool for reuse
+            if crawler:
+                try:
+                    if _browser_pool_initialized and _browser_pool:
+                        await _browser_pool.put(crawler)
+                    else:
+                        # Cleanup if pool not available
+                        await crawler.__aexit__(None, None, None)
+                except Exception as e:
+                    logging.warning(f"[HEAVY] Error returning browser to pool: {e}")
 
 # -------------------- pipeline worker --------------------
 
@@ -1311,9 +1437,15 @@ async def process_url(
                         manifest_fh.flush()
                     logging.info(f"[FAST] {url} -> {path if path else 'N/A'} ({products_found} products, {products_saved} saved)")
                     
+                    # Cleanup large objects
+                    del html, ld, inline, products
+                    gc.collect()
+                    
                     # Update database
                     if url_id:
                         update_url_processing_result(url_id, success, products_found, products_saved, error_msg)
+                    # Check limits after processing URL
+                    check_limits()
                     return
 
                 candidates = find_xhr_candidates(html, final_url)
@@ -1347,74 +1479,96 @@ async def process_url(
                                     manifest_fh.flush()
                                 logging.info(f"[API] {url} -> {path if path else 'N/A'} via {c} ({products_found} products, {products_saved} saved)")
                                 
+                                # Cleanup large objects
+                                del html, api_json, products
+                                gc.collect()
+                                
                                 # Update database
                                 if url_id:
                                     update_url_processing_result(url_id, success, products_found, products_saved, error_msg)
+                                # Check limits after processing URL
+                                check_limits()
                                 return
                         except Exception:
                             logging.debug(f"API fetch failed for {c}", exc_info=True)
                             continue
 
                 expected_selector = HEAVY_EXPECTED_SELECTOR
-                res, rendered_html, screenshot = await heavy_render(url, expected_selector=expected_selector)
-                if res and getattr(res, "success", False) and rendered_html and len(rendered_html) > 1500:
-                    path = None
-                    if SAVE_HTML_FILES:
-                        save_dir = OUT_DIR / domain
-                        save_dir.mkdir(parents=True, exist_ok=True)
-                        fname = safe_filename_for_url(url)
-                        path = save_dir / fname
-                        path.write_text(rendered_html, encoding="utf-8")
-                        if screenshot:
-                            try:
-                                import base64
-                                ssb = screenshot
-                                if isinstance(ssb, str):
-                                    ssb = base64.b64decode(ssb)
-                                (path.with_suffix(".png")).write_bytes(ssb)
-                            except Exception:
-                                pass
-                    
-                    rendered_ld = extract_ld_json(rendered_html)
-                    rendered_inline = extract_inline_json(rendered_html)
-                    products = extract_products_from_sources(rendered_html, rendered_ld, rendered_inline, final_url)
-                    products_found = len(products)
-                    if products:
-                        saved_count = save_products_to_supabase(products, final_url, domain, product_type_id)
-                        products_saved = saved_count
-                        status["products_extracted"] = products_found
-                        status["products_saved"] = products_saved
-                    
-                    success = products_found > 0
-                    path_str = str(path) if path else None
-                    status.update({"stage": "heavy", "ok": success, "path": path_str, "elapsed": time.time()-ts0})
-                    if manifest_fh:
-                        manifest_fh.write(json.dumps(status, default=str) + "\n")
-                        manifest_fh.flush()
-                    logging.info(f"[HEAVY] {url} -> {path_str if path_str else 'N/A'} ({products_found} products, {products_saved} saved)")
-                    
-                    # Update database
-                    if url_id:
-                        update_url_processing_result(url_id, success, products_found, products_saved, error_msg)
-                    return
-                else:
-                    if SAVE_HTML_FILES:
-                        save_dir = OUT_DIR / domain
-                        save_dir.mkdir(parents=True, exist_ok=True)
-                        fname = safe_filename_for_url(url)
-                        (save_dir / ("failed_" + fname)).write_text(html[:4000], encoding="utf-8")
-                    error_msg = "no content or render failed"
-                    success = False
-                    status.update({"stage": "failed", "ok": False, "err": error_msg, "elapsed": time.time()-ts0})
-                    if manifest_fh:
-                        manifest_fh.write(json.dumps(status, default=str) + "\n")
-                        manifest_fh.flush()
-                    logging.warning(f"[FAIL] {url} ({error_msg})")
-                    
-                    # Update database
-                    if url_id:
-                        update_url_processing_result(url_id, success, products_found, products_saved, error_msg)
-                    return
+                res, rendered_html, screenshot_path = await heavy_render(url, expected_selector=expected_selector)
+                screenshot_cleanup = False
+                try:
+                    if res and getattr(res, "success", False) and rendered_html and len(rendered_html) > 1500:
+                        path = None
+                        if SAVE_HTML_FILES:
+                            save_dir = OUT_DIR / domain
+                            save_dir.mkdir(parents=True, exist_ok=True)
+                            fname = safe_filename_for_url(url)
+                            path = save_dir / fname
+                            path.write_text(rendered_html, encoding="utf-8")
+                            if screenshot_path and os.path.exists(screenshot_path):
+                                try:
+                                    # Copy temp screenshot to final location if saving files
+                                    import shutil
+                                    shutil.copy2(screenshot_path, path.with_suffix(".png"))
+                                except Exception as e:
+                                    logging.warning(f"[HEAVY] Failed to copy screenshot: {e}")
+                        
+                        rendered_ld = extract_ld_json(rendered_html)
+                        rendered_inline = extract_inline_json(rendered_html)
+                        products = extract_products_from_sources(rendered_html, rendered_ld, rendered_inline, final_url)
+                        products_found = len(products)
+                        if products:
+                            saved_count = save_products_to_supabase(products, final_url, domain, product_type_id)
+                            products_saved = saved_count
+                            status["products_extracted"] = products_found
+                            status["products_saved"] = products_saved
+                        
+                        success = products_found > 0
+                        path_str = str(path) if path else None
+                        status.update({"stage": "heavy", "ok": success, "path": path_str, "elapsed": time.time()-ts0})
+                        if manifest_fh:
+                            manifest_fh.write(json.dumps(status, default=str) + "\n")
+                            manifest_fh.flush()
+                        logging.info(f"[HEAVY] {url} -> {path_str if path_str else 'N/A'} ({products_found} products, {products_saved} saved)")
+                        
+                        # Cleanup large objects
+                        del rendered_html, rendered_ld, rendered_inline, products
+                        gc.collect()
+                        
+                        # Update database
+                        if url_id:
+                            update_url_processing_result(url_id, success, products_found, products_saved, error_msg)
+                        # Check limits after processing URL
+                        check_limits()
+                        return
+                    else:
+                        if SAVE_HTML_FILES:
+                            save_dir = OUT_DIR / domain
+                            save_dir.mkdir(parents=True, exist_ok=True)
+                            fname = safe_filename_for_url(url)
+                            (save_dir / ("failed_" + fname)).write_text(html[:4000], encoding="utf-8")
+                        error_msg = "no content or render failed"
+                        success = False
+                        status.update({"stage": "failed", "ok": False, "err": error_msg, "elapsed": time.time()-ts0})
+                        if manifest_fh:
+                            manifest_fh.write(json.dumps(status, default=str) + "\n")
+                            manifest_fh.flush()
+                        logging.warning(f"[FAIL] {url} ({error_msg})")
+                        
+                        # Update database
+                        if url_id:
+                            update_url_processing_result(url_id, success, products_found, products_saved, error_msg)
+                        # Check limits after processing URL
+                        check_limits()
+                        return
+                finally:
+                    # Cleanup temp screenshot file
+                    if screenshot_path and os.path.exists(screenshot_path):
+                        try:
+                            os.remove(screenshot_path)
+                            screenshot_cleanup = True
+                        except Exception as e:
+                            logging.warning(f"[HEAVY] Failed to delete temp screenshot: {e}")
 
             except Exception as e:
                 error_msg = str(e)[:500]
@@ -1428,9 +1582,25 @@ async def process_url(
                 # Update database
                 if url_id:
                     update_url_processing_result(url_id, success, products_found, products_saved, error_msg)
+                # Check limits after processing URL
+                check_limits()
                 return
 
 # -------------------- main --------------------
+
+async def background_limits_monitor(interval_seconds: int = 15):
+    """Background task that periodically checks memory and thread limits as a safety net."""
+    while True:
+        try:
+            await asyncio.sleep(interval_seconds)
+            check_limits()
+        except asyncio.CancelledError:
+            logging.info("[MONITOR] Background limits monitor cancelled")
+            break
+        except Exception as e:
+            logging.warning(f"[MONITOR] Error in background limits monitor: {e}")
+            # Continue monitoring even if one check fails
+            continue
 
 async def main_from_db(batch_size: int = 100, max_batches: Optional[int] = None):
     """Main function that processes URLs from database."""
@@ -1438,98 +1608,141 @@ async def main_from_db(batch_size: int = 100, max_batches: Optional[int] = None)
     worker_id = f"{socket.gethostname()}-{os.getpid()}"
     logging.info(f"[DB] Starting worker: {worker_id}")
     
-    connector = aiohttp.TCPConnector(ssl=_SSL_CTX, limit=GLOBAL_CONCURRENCY)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        # Open manifest file only if SAVE_HTML_FILES is enabled
-        manifest_file = None
-        if MANIFEST_PATH:
-            manifest_file = open(MANIFEST_PATH, "a", encoding="utf-8")
-            mf = manifest_file
-        else:
-            mf = None
-        try:
-            batch_num = 0
-            total_processed = 0
-            consecutive_empty_batches = 0
-            
-            # Continuous polling mode - check for new URLs every minute when queue is empty
-            POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))  # Default: 60 seconds
-            
-            while True:
-                update_activity()  # Update at start of each iteration
-                
-                if max_batches and batch_num >= max_batches:
-                    logging.info(f"[DB] Reached max_batches limit ({max_batches}). Exiting.")
-                    watchdog.cancel()  # Cancel watchdog before exit
-                    break
-                
-                # Fetch pending URLs from database
-                update_activity()  # Update before DB call
-                pending_urls = fetch_pending_urls_from_db(limit=batch_size, worker_id=worker_id)
-                update_activity()  # Update after DB call
-                
-                if not pending_urls:
-                    consecutive_empty_batches += 1
-                    update_activity()  # Update even when idle
-                    logging.info(f"[DB] No pending URLs found (attempt {consecutive_empty_batches}). "
-                                f"Waiting {POLL_INTERVAL}s before checking again...")
-                    # Wait before checking again - continuous background worker behavior
-                    for _ in range(POLL_INTERVAL):
-                        await asyncio.sleep(1)
-                        update_activity()  # Update every second during sleep
-                    continue  # Check again instead of breaking
-                
-                # Reset empty batch counter when we find URLs
+    # Initialize browser pool for reuse
+    await _init_browser_pool()
+    
+    try:
+        connector = aiohttp.TCPConnector(ssl=_SSL_CTX, limit=GLOBAL_CONCURRENCY)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            # Open manifest file only if SAVE_HTML_FILES is enabled
+            manifest_file = None
+            if MANIFEST_PATH:
+                manifest_file = open(MANIFEST_PATH, "a", encoding="utf-8")
+                mf = manifest_file
+            else:
+                mf = None
+            try:
+                batch_num = 0
+                total_processed = 0
                 consecutive_empty_batches = 0
                 
-                batch_num += 1
-                logging.info(f"[DB] Batch {batch_num}: Processing {len(pending_urls)} URLs")
+                # Continuous polling mode - check for new URLs every minute when queue is empty
+                POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))  # Default: 60 seconds
+                MONITOR_INTERVAL = int(os.getenv("MONITOR_INTERVAL_SECONDS", "15"))  # Background monitor every 15s
                 
-                # Process all URLs in this batch
-                tasks = [
-                    process_url(
-                        url_data["product_page_url"],
-                        session,
-                        mf,
-                        url_id=url_data["id"],
-                        product_type_id=url_data.get("product_type_id")
-                    )
-                    for url_data in pending_urls
-                ]
+                # Start background limits monitor as a safety net
+                monitor_task = asyncio.create_task(background_limits_monitor(MONITOR_INTERVAL))
+                logging.info(f"[MONITOR] Started background limits monitor (interval: {MONITOR_INTERVAL}s)")
                 
-                await asyncio.gather(*tasks)
-                total_processed += len(pending_urls)
-                update_activity()  # Update after batch completion
-                
-                logging.info(f"[DB] Batch {batch_num} completed. Total processed: {total_processed}")
-                
-                # Small delay between batches to avoid overwhelming the database
-                await asyncio.sleep(1)
-                update_activity()  # Update after sleep
-        finally:
-            if manifest_file:
-                manifest_file.close()
+                try:
+                    while True:
+                        update_activity()  # Update at start of each iteration
+                        
+                        if max_batches and batch_num >= max_batches:
+                            logging.info(f"[DB] Reached max_batches limit ({max_batches}). Exiting.")
+                            break
+                        
+                        # Fetch pending URLs from database
+                        update_activity()  # Update before DB call
+                        pending_urls = fetch_pending_urls_from_db(limit=batch_size, worker_id=worker_id)
+                        update_activity()  # Update after DB call
+                        
+                        if not pending_urls:
+                            consecutive_empty_batches += 1
+                            update_activity()  # Update even when idle
+                            logging.info(f"[DB] No pending URLs found (attempt {consecutive_empty_batches}). "
+                                        f"Waiting {POLL_INTERVAL}s before checking again...")
+                            # Wait before checking again - continuous background worker behavior
+                            for _ in range(POLL_INTERVAL):
+                                await asyncio.sleep(1)
+                                update_activity()  # Update every second during sleep
+                            continue  # Check again instead of breaking
+                        
+                        # Reset empty batch counter when we find URLs
+                        consecutive_empty_batches = 0
+                        
+                        batch_num += 1
+                        logging.info(f"[DB] Batch {batch_num}: Processing {len(pending_urls)} URLs")
+                        
+                        # Process all URLs in this batch
+                        tasks = [
+                            process_url(
+                                url_data["product_page_url"],
+                                session,
+                                mf,
+                                url_id=url_data["id"],
+                                product_type_id=url_data.get("product_type_id")
+                            )
+                            for url_data in pending_urls
+                        ]
+                        
+                        await asyncio.gather(*tasks)
+                        total_processed += len(pending_urls)
+                        update_activity()  # Update after batch completion
+                        
+                        # Check limits after each batch
+                        check_limits()
+                        
+                        logging.info(f"[DB] Batch {batch_num} completed. Total processed: {total_processed}")
+                        
+                        # Small delay between batches to avoid overwhelming the database
+                        await asyncio.sleep(1)
+                        update_activity()  # Update after sleep
+                finally:
+                    # Cancel background monitor
+                    monitor_task.cancel()
+                    try:
+                        await monitor_task
+                    except asyncio.CancelledError:
+                        pass
+            finally:
+                if manifest_file:
+                    manifest_file.close()
+    finally:
+        # Cleanup browser pool
+        await _cleanup_browser_pool()
     
     logging.info(f"[DB] Worker {worker_id} finished. Total URLs processed: {total_processed}")
 
 async def main(urls):
     """Main function for command-line URL processing (backward compatibility)."""
-    # Create the aiohttp connector inside the running event loop (fixes "no running event loop")
-    connector = aiohttp.TCPConnector(ssl=_SSL_CTX, limit=GLOBAL_CONCURRENCY)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        # Open manifest file only if SAVE_HTML_FILES is enabled
-        if MANIFEST_PATH:
-            manifest_file = open(MANIFEST_PATH, "a", encoding="utf-8")
-            mf = manifest_file
-        else:
-            manifest_file = None
-            mf = None
-        try:
-            tasks = [process_url(u, session, mf) for u in urls]
-            await asyncio.gather(*tasks)
-        finally:
-            if manifest_file:
-                manifest_file.close()
+    # Initialize browser pool for reuse
+    await _init_browser_pool()
+    
+    try:
+        # Create the aiohttp connector inside the running event loop (fixes "no running event loop")
+        connector = aiohttp.TCPConnector(ssl=_SSL_CTX, limit=GLOBAL_CONCURRENCY)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            # Open manifest file only if SAVE_HTML_FILES is enabled
+            if MANIFEST_PATH:
+                manifest_file = open(MANIFEST_PATH, "a", encoding="utf-8")
+                mf = manifest_file
+            else:
+                manifest_file = None
+                mf = None
+            
+            # Start background limits monitor as a safety net
+            MONITOR_INTERVAL = int(os.getenv("MONITOR_INTERVAL_SECONDS", "15"))  # Background monitor every 15s
+            monitor_task = asyncio.create_task(background_limits_monitor(MONITOR_INTERVAL))
+            logging.info(f"[MONITOR] Started background limits monitor (interval: {MONITOR_INTERVAL}s)")
+            
+            try:
+                tasks = [process_url(u, session, mf) for u in urls]
+                await asyncio.gather(*tasks)
+                # Check limits after processing all URLs
+                check_limits()
+            finally:
+                # Cancel background monitor
+                monitor_task.cancel()
+                try:
+                    await monitor_task
+                except asyncio.CancelledError:
+                    pass
+                if manifest_file:
+                    manifest_file.close()
+    finally:
+        # Cleanup browser pool
+        await _cleanup_browser_pool()
 
 if __name__ == "__main__":
     import sys
