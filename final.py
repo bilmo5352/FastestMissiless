@@ -19,6 +19,7 @@ from collections import defaultdict
 from typing import List, Dict, Any, Optional, TYPE_CHECKING, Iterable
 import re
 from datetime import datetime, timezone
+import subprocess
 
 # Fix Windows console encoding issue with Crawl4AI rich logger
 if sys.platform == "win32":
@@ -1165,7 +1166,7 @@ async def fetch_html(session: aiohttp.ClientSession, url: str):
 
 # -------------------- heavy render via Crawl4AI --------------------
 
-def _get_browser_config():
+def get_browser_config():
     """Get browser configuration for containerized environments."""
     return BrowserConfig(
         headless=True,
@@ -1181,208 +1182,386 @@ def _get_browser_config():
         verbose=True,  # Enable verbose logging to see what's happening
     )
 
-async def _init_browser_pool():
-    """Initialize browser pool with HEAVY_CONCURRENCY browsers."""
-    global _browser_pool, _browser_pool_initialized
-    if _browser_pool_initialized:
-        return
-    
-    _browser_pool = asyncio.Queue(maxsize=HEAVY_CONCURRENCY)
-    browser_conf = _get_browser_config()
-    
-    logging.info(f"[BROWSER_POOL] Initializing {HEAVY_CONCURRENCY} browser instances...")
-    for i in range(HEAVY_CONCURRENCY):
-        try:
-            crawler = AsyncWebCrawler(config=browser_conf)
-            await crawler.__aenter__()  # Initialize the browser
-            await _browser_pool.put(crawler)
-            logging.info(f"[BROWSER_POOL] Browser {i+1}/{HEAVY_CONCURRENCY} initialized")
-        except Exception as e:
-            logging.error(f"[BROWSER_POOL] Failed to initialize browser {i+1}: {e}")
-            # Continue with fewer browsers if some fail
-    
-    _browser_pool_initialized = True
-    logging.info(f"[BROWSER_POOL] Browser pool initialized with {_browser_pool.qsize()} browsers")
+# ====================
+# BROWSER POOL GLOBALS
+# ====================
+browser_pool = None
+browser_pool_initialized = False
+browser_pool_lock = asyncio.Lock()
 
-async def _cleanup_browser_pool():
-    """Clean up all browsers in the pool."""
-    global _browser_pool, _browser_pool_initialized
-    if not _browser_pool_initialized or not _browser_pool:
+async def init_browser_pool():
+    """Initialize browser pool with HEAVY_CONCURRENCY browsers."""
+    global browser_pool, browser_pool_initialized
+    
+    async with browser_pool_lock:
+        if browser_pool_initialized:
+            return
+        
+        browser_pool = asyncio.Queue(maxsize=HEAVY_CONCURRENCY)
+        browser_conf = get_browser_config()
+        
+        logging.info(f"[BROWSER_POOL] Initializing {HEAVY_CONCURRENCY} browser instances...")
+        
+        for i in range(HEAVY_CONCURRENCY):
+            try:
+                crawler = AsyncWebCrawler(config=browser_conf)
+                await crawler.__aenter__()
+                await browser_pool.put({
+                    'crawler': crawler,
+                    'id': i + 1,
+                    'created_at': time.time(),
+                    'usage_count': 0,
+                    'healthy': True,
+                    'last_used': time.time()
+                })
+                logging.info(f"[BROWSER_POOL] Browser #{i+1}/{HEAVY_CONCURRENCY} initialized")
+            except Exception as e:
+                logging.error(f"[BROWSER_POOL] Failed to initialize browser #{i+1}: {e}")
+        
+        browser_pool_initialized = True
+        logging.info(f"[BROWSER_POOL] Browser pool ready with {browser_pool.qsize()} browsers")
+
+
+async def cleanup_browser_pool():
+    """Cleanup all browsers in the pool."""
+    global browser_pool, browser_pool_initialized
+    
+    if not browser_pool_initialized:
         return
     
     logging.info("[BROWSER_POOL] Cleaning up browser pool...")
-    count = 0
-    while not _browser_pool.empty():
-        try:
-            crawler = await _browser_pool.get()
-            await crawler.__aexit__(None, None, None)  # Cleanup the browser
-            count += 1
-        except Exception as e:
-            logging.warning(f"[BROWSER_POOL] Error cleaning up browser: {e}")
     
-    _browser_pool_initialized = False
-    logging.info(f"[BROWSER_POOL] Cleaned up {count} browsers")
+    # Drain the queue
+    browsers_to_cleanup = []
+    while not browser_pool.empty():
+        try:
+            browser_obj = await asyncio.wait_for(browser_pool.get(), timeout=1)
+            browsers_to_cleanup.append(browser_obj)
+        except asyncio.TimeoutError:
+            break
+    
+    # Cleanup each browser
+    for browser_obj in browsers_to_cleanup:
+        try:
+            await browser_obj['crawler'].__aexit__(None, None, None)
+            logging.info(f"[BROWSER_POOL] Cleaned up browser #{browser_obj['id']}")
+        except Exception as e:
+            logging.warning(f"[BROWSER_POOL] Error cleaning browser #{browser_obj['id']}: {e}")
+    
+    browser_pool = None
+    browser_pool_initialized = False
+    logging.info("[BROWSER_POOL] Browser pool cleanup complete")
+
+
+async def get_healthy_browser():
+    """Get a healthy browser from pool, replace if dead."""
+    global browser_pool
+    
+    if not browser_pool_initialized:
+        await init_browser_pool()
+    
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            browser_obj = await asyncio.wait_for(browser_pool.get(), timeout=5)
+            crawler = browser_obj['crawler']
+            
+            # Health check
+            try:
+                if hasattr(crawler, 'browser') and crawler.browser:
+                    # Browser seems alive
+                    browser_obj['usage_count'] += 1
+                    browser_obj['last_used'] = time.time()
+                    return browser_obj
+                else:
+                    raise Exception("Browser instance is None")
+            except Exception as health_error:
+                logging.warning(f"[BROWSER_POOL] Browser #{browser_obj['id']} is dead: {health_error}")
+                
+                # Clean up dead browser
+                try:
+                    await crawler.__aexit__(None, None, None)
+                except:
+                    pass
+                
+                # Create replacement
+                try:
+                    browser_conf = get_browser_config()
+                    new_crawler = AsyncWebCrawler(config=browser_conf)
+                    await new_crawler.__aenter__()
+                    
+                    browser_obj = {
+                        'crawler': new_crawler,
+                        'id': browser_obj['id'],
+                        'created_at': time.time(),
+                        'usage_count': 0,
+                        'healthy': True,
+                        'last_used': time.time()
+                    }
+                    logging.info(f"[BROWSER_POOL] Replaced dead browser #{browser_obj['id']}")
+                    return browser_obj
+                except Exception as e:
+                    logging.error(f"[BROWSER_POOL] Failed to replace browser: {e}")
+                    continue
+                
+        except asyncio.TimeoutError:
+            logging.error(f"[BROWSER_POOL] Timeout getting browser (attempt {attempt+1}/{max_retries})")
+            continue
+        except Exception as e:
+            logging.error(f"[BROWSER_POOL] Error getting browser: {e}")
+            continue
+    
+    # Fallback: create temporary browser
+    logging.warning("[BROWSER_POOL] Creating temporary browser (pool exhausted)")
+    try:
+        browser_conf = get_browser_config()
+        crawler = AsyncWebCrawler(config=browser_conf)
+        await crawler.__aenter__()
+        return {
+            'crawler': crawler,
+            'id': 999,
+            'created_at': time.time(),
+            'usage_count': 0,
+            'healthy': True,
+            'temporary': True,
+            'last_used': time.time()
+        }
+    except Exception as e:
+        logging.error(f"[BROWSER_POOL] Failed to create temporary browser: {e}")
+        raise
+
+
+async def return_browser(browser_obj):
+    """Return browser to pool or cleanup if unhealthy."""
+    global browser_pool
+    
+    if not browser_obj:
+        return
+    
+    # If temporary browser, clean it up
+    if browser_obj.get('temporary', False):
+        try:
+            await browser_obj['crawler'].__aexit__(None, None, None)
+            logging.info("[BROWSER_POOL] Cleaned up temporary browser")
+        except:
+            pass
+        return
+    
+    # Check if browser should be recycled
+    age = time.time() - browser_obj['created_at']
+    should_recycle = (
+        browser_obj['usage_count'] > 50 or  # Used too many times
+        age > 1800 or  # Older than 30 minutes
+        not browser_obj.get('healthy', True)  # Marked as unhealthy
+    )
+    
+    if should_recycle:
+        reason = "age" if age > 1800 else "usage" if browser_obj['usage_count'] > 50 else "unhealthy"
+        logging.info(f"[BROWSER_POOL] Recycling browser #{browser_obj['id']} ({reason})")
+        
+        # Cleanup old browser
+        try:
+            await browser_obj['crawler'].__aexit__(None, None, None)
+        except:
+            pass
+        
+        # Create replacement
+        try:
+            browser_conf = get_browser_config()
+            new_crawler = AsyncWebCrawler(config=browser_conf)
+            await new_crawler.__aenter__()
+            browser_obj = {
+                'crawler': new_crawler,
+                'id': browser_obj['id'],
+                'created_at': time.time(),
+                'usage_count': 0,
+                'healthy': True,
+                'last_used': time.time()
+            }
+            logging.info(f"[BROWSER_POOL] Created replacement browser #{browser_obj['id']}")
+        except Exception as e:
+            logging.error(f"[BROWSER_POOL] Failed to create replacement: {e}")
+            return
+    
+    # Return to pool
+    try:
+        if browser_pool:
+            await browser_pool.put(browser_obj)
+    except Exception as e:
+        logging.error(f"[BROWSER_POOL] Error returning browser to pool: {e}")
+
+
+async def recycle_browser_pool():
+    """Periodically recycle entire browser pool."""
+    while True:
+        await asyncio.sleep(600)  # Every 10 minutes
+        
+        logging.info("[BROWSER_POOL] Starting periodic full pool recycle...")
+        try:
+            await cleanup_browser_pool()
+            await asyncio.sleep(2)  # Brief pause
+            await init_browser_pool()
+            logging.info("[BROWSER_POOL] Full pool recycle completed successfully")
+        except Exception as e:
+            logging.error(f"[BROWSER_POOL] Error during pool recycle: {e}")
 
 async def heavy_render(url: str, expected_selector: str = None):
-    # Check limits before heavy browser work
+    """Render URL with browser from pool."""
     check_limits()
     
     async with heavy_sem:
-        # Get browser from pool (reuse existing instance)
-        crawler = None
+        browser_obj = None
         try:
-            if _browser_pool_initialized and _browser_pool:
-                crawler = await _browser_pool.get()
-                logging.info(f"[HEAVY] Reusing browser for {url}")
-            else:
-                # Fallback: create new browser if pool not initialized
-                browser_conf = _get_browser_config()
-                crawler = AsyncWebCrawler(config=browser_conf)
-                await crawler.__aenter__()
-                logging.info(f"[HEAVY] Created new browser for {url} (pool not available)")
-        except Exception as browser_init_error:
-            update_activity()
-            logging.error(f"[HEAVY] Browser initialization FAILED for {url}: {str(browser_init_error)[:300]}")
-            return None, "", None
-        
-        try:
-            # Detect if it's a Wix site and adjust js_code accordingly
+            # Get healthy browser
+            browser_obj = await get_healthy_browser()
+            crawler = browser_obj['crawler']
+            
+            logging.info(f"[HEAVY] Using browser #{browser_obj['id']} (uses: {browser_obj['usage_count']}) for {url}")
+            
+            # Detect Wix sites
             is_wix = 'wix' in url.lower()
             
+            # JavaScript for scrolling
             js_scroll = [
-                # Slow progressive scroll
-                "(()=>{window.scrollTo({top: document.body.scrollHeight/4, behavior: 'smooth'});return true})()",
-                "(()=>{window.scrollTo({top: document.body.scrollHeight/2, behavior: 'smooth'});return true})()",
-                "(()=>{window.scrollTo({top: document.body.scrollHeight, behavior: 'smooth'});return true})()",
+                'window.scrollTo({top: document.body.scrollHeight/4, behavior: "smooth"});return true;',
+                'window.scrollTo({top: document.body.scrollHeight/2, behavior: "smooth"});return true;',
+                'window.scrollTo({top: document.body.scrollHeight, behavior: "smooth"});return true;',
             ]
             
             if is_wix:
-                # Additional Wix-specific JavaScript to trigger lazy loading
                 js_scroll.extend([
-                    # Trigger Wix lazy load events
-                    "(()=>{window.dispatchEvent(new Event('scroll'));return true})()",
-                    "(()=>{window.dispatchEvent(new Event('resize'));return true})()",
+                    'window.dispatchEvent(new Event("scroll"));return true;',
+                    'window.dispatchEvent(new Event("resize"));return true;',
                 ])
             
-            # Clean up selector - remove empty selectors that cause timeout errors
+            # Clean selector
             clean_selector = None
             if expected_selector:
-                # Remove empty selectors (caused by trailing commas)
                 parts = [s.strip() for s in expected_selector.split(',') if s.strip()]
                 if parts:
                     clean_selector = ', '.join(parts)
             
-            # Try with wait_for first, but fallback to no wait if it fails
+            # Crawler run config
             run_conf = CrawlerRunConfig(
                 cache_mode=CacheMode.BYPASS,
                 stream=False,
-                wait_for=(f"css:{clean_selector}" if clean_selector else None),
+                wait_for=f"css:{clean_selector}" if clean_selector else None,
                 js_code=js_scroll,
                 page_timeout=PAGE_TIMEOUT_MS,
                 delay_before_return_html=DELAY_AFTER_WAIT,
-                scan_full_page=True,  # Enable full page scan for Wix
-                wait_for_images=True,  # Wait for images on Wix sites
-                scroll_delay=0.5,  # Slower scroll for dynamic content
+                scan_full_page=True,
+                wait_for_images=True if is_wix else False,
+                scroll_delay=0.5,
             )
             
-            update_activity()  # Update before crawl
+            update_activity()
             logging.info(f"[HEAVY] Starting crawl for {url}")
             
             try:
-                # Add timeout wrapper to prevent hanging
                 res = await asyncio.wait_for(
                     crawler.arun(url, config=run_conf),
                     timeout=HEAVY_RENDER_TIMEOUT
                 )
-                update_activity()  # Update after successful crawl
+                update_activity()
                 logging.info(f"[HEAVY] Crawl completed for {url}")
-                html = getattr(res, "html", "") or getattr(res, "content", "") or ""
+                
+                html = getattr(res, 'html', '') or getattr(res, 'content', '') or ''
                 screenshot_path = None
-                screenshot = getattr(res, "screenshot", None)
+                screenshot = getattr(res, 'screenshot', None)
+                
                 if screenshot:
                     try:
-                        # Save screenshot to temp file instead of keeping in memory
+                        import tempfile, base64
                         temp_dir = tempfile.gettempdir()
                         screenshot_path = os.path.join(temp_dir, f"{uuid.uuid4().hex}.png")
                         ssb = screenshot
                         if isinstance(ssb, str):
-                            import base64
                             ssb = base64.b64decode(ssb)
-                        with open(screenshot_path, "wb") as f:
+                        with open(screenshot_path, 'wb') as f:
                             f.write(ssb)
-                        logging.debug(f"[HEAVY] Screenshot saved to temp file: {screenshot_path}")
                     except Exception as e:
-                        logging.warning(f"[HEAVY] Failed to save screenshot to temp file: {e}")
+                        logging.warning(f"[HEAVY] Failed to save screenshot: {e}")
                         screenshot_path = None
+                
                 return res, html, screenshot_path
+                
             except asyncio.TimeoutError:
-                update_activity()  # Update even on timeout
+                update_activity()
                 logging.error(f"[HEAVY] Crawl TIMEOUT after {HEAVY_RENDER_TIMEOUT}s for {url}")
-                return None, "", None
+                browser_obj['healthy'] = False
+                return None, '', None
+                
             except Exception as e:
-                update_activity()  # Update even on error
+                update_activity()
                 error_msg = str(e)
                 logging.error(f"[HEAVY] Crawl error for {url}: {error_msg[:200]}")
-                # If timeout on selector, try again without wait_for
-                if "timeout" in error_msg.lower() or "wait condition failed" in error_msg.lower():
-                    logging.info(f"[HEAVY] Selector timeout for {url}, retrying without wait condition")
-                try:
-                    update_activity()  # Update before retry
-                    # Retry without wait_for - just wait for page load
-                    fallback_conf = CrawlerRunConfig(
-                        cache_mode=CacheMode.BYPASS,
-                        stream=False,
-                        wait_for=None,  # No selector wait
-                        js_code=js_scroll,
-                        page_timeout=PAGE_TIMEOUT_MS,
-                        delay_before_return_html=DELAY_AFTER_WAIT,
-                        scan_full_page=True,
-                        wait_for_images=False,  # Don't wait for images on retry
-                        scroll_delay=0.5,
-                    )
-                    res = await asyncio.wait_for(
-                        crawler.arun(url, config=fallback_conf),
-                        timeout=HEAVY_RENDER_TIMEOUT
-                    )
-                    update_activity()  # Update after retry
-                    html = getattr(res, "html", "") or getattr(res, "content", "") or ""
-                    screenshot_path = None
-                    screenshot = getattr(res, "screenshot", None)
-                    if screenshot:
-                        try:
-                            # Save screenshot to temp file instead of keeping in memory
-                            temp_dir = tempfile.gettempdir()
-                            screenshot_path = os.path.join(temp_dir, f"{uuid.uuid4().hex}.png")
-                            ssb = screenshot
-                            if isinstance(ssb, str):
-                                import base64
-                                ssb = base64.b64decode(ssb)
-                            with open(screenshot_path, "wb") as f:
-                                f.write(ssb)
-                            logging.debug(f"[HEAVY] Screenshot saved to temp file: {screenshot_path}")
-                        except Exception as e:
-                            logging.warning(f"[HEAVY] Failed to save screenshot to temp file: {e}")
-                            screenshot_path = None
-                    return res, html, screenshot_path
-                except asyncio.TimeoutError:
-                    update_activity()
-                    logging.error(f"[HEAVY] Fallback also TIMEOUT for {url}")
-                    return None, "", None
-                except Exception as e2:
-                    update_activity()
-                    logging.error(f"[HEAVY] Fallback also failed for {url}: {str(e2)[:200]}")
-                    return None, "", None
+                
+                # Mark browser unhealthy if browser-related error
+                if any(keyword in error_msg.lower() for keyword in ['closed', 'context', 'browser', 'target']):
+                    browser_obj['healthy'] = False
+                    logging.warning(f"[HEAVY] Marked browser #{browser_obj['id']} as unhealthy")
+                
+                # Try fallback without wait_for
+                if 'timeout' in error_msg.lower() or 'wait' in error_msg.lower():
+                    logging.info(f"[HEAVY] Retrying without wait condition for {url}")
+                    try:
+                        fallback_conf = CrawlerRunConfig(
+                            cache_mode=CacheMode.BYPASS,
+                            stream=False,
+                            wait_for=None,
+                            js_code=js_scroll,
+                            page_timeout=PAGE_TIMEOUT_MS,
+                            delay_before_return_html=DELAY_AFTER_WAIT,
+                            scan_full_page=True,
+                            wait_for_images=False,
+                            scroll_delay=0.5,
+                        )
+                        res = await asyncio.wait_for(
+                            crawler.arun(url, config=fallback_conf),
+                            timeout=HEAVY_RENDER_TIMEOUT
+                        )
+                        update_activity()
+                        html = getattr(res, 'html', '') or ''
+                        return res, html, None
+                    except Exception as retry_error:
+                        logging.error(f"[HEAVY] Fallback also failed: {retry_error}")
+                        return None, '', None
+                
+                return None, '', None
+                
+        except Exception as outer_error:
+            logging.error(f"[HEAVY] Outer error in heavy_render: {outer_error}")
+            if browser_obj:
+                browser_obj['healthy'] = False
+            return None, '', None
+            
         finally:
-            # Return browser to pool for reuse
-            if crawler:
-                try:
-                    if _browser_pool_initialized and _browser_pool:
-                        await _browser_pool.put(crawler)
-                    else:
-                        # Cleanup if pool not available
-                        await crawler.__aexit__(None, None, None)
-                except Exception as e:
-                    logging.warning(f"[HEAVY] Error returning browser to pool: {e}")
+            # Always return browser to pool
+            if browser_obj:
+                await return_browser(browser_obj)
+
+#---------------------railway_restart----------------------#
+async def periodic_restart(interval_hours=2):
+    """Run railway_restart.py every interval_hours hours indefinitely."""
+    interval_seconds = interval_hours * 3600
+    while True:
+        logging.info(f"[FINAL-SCHEDULER] Starting railway_restart.py at {datetime.now()}")
+        proc = await asyncio.create_subprocess_exec(
+            "python", "railway_restart.py",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        stdout, stderr = await proc.communicate()
+
+        if stdout:
+            logging.info(f"[FINAL-SCHEDULER] Restart stdout:\n{stdout.decode()}")
+        if stderr:
+            logging.error(f"[FINAL-SCHEDULER] Restart stderr:\n{stderr.decode()}")
+
+        logging.info(f"[FINAL-SCHEDULER] Restart script exited with code {proc.returncode}")
+        logging.info(f"[FINAL-SCHEDULER] Sleeping for {interval_hours} hours...")
+        await asyncio.sleep(interval_seconds)
 
 # -------------------- pipeline worker --------------------
 
@@ -1609,7 +1788,11 @@ async def main_from_db(batch_size: int = 100, max_batches: Optional[int] = None)
     logging.info(f"[DB] Starting worker: {worker_id}")
     
     # Initialize browser pool for reuse
-    await _init_browser_pool()
+    await init_browser_pool()
+    
+    # Start browser pool recycling task
+    recycle_task = asyncio.create_task(recycle_browser_pool())
+    logging.info("[MAIN] Started browser pool recycling task")
     
     try:
         connector = aiohttp.TCPConnector(ssl=_SSL_CTX, limit=GLOBAL_CONCURRENCY)
@@ -1699,16 +1882,24 @@ async def main_from_db(batch_size: int = 100, max_batches: Optional[int] = None)
                 if manifest_file:
                     manifest_file.close()
     finally:
+        # Cancel browser pool recycling task
+        recycle_task.cancel()
+        try:
+            await recycle_task
+        except asyncio.CancelledError:
+            pass
+        
         # Cleanup browser pool
-        await _cleanup_browser_pool()
+        await cleanup_browser_pool()
     
     logging.info(f"[DB] Worker {worker_id} finished. Total URLs processed: {total_processed}")
 
 async def main(urls):
     """Main function for command-line URL processing (backward compatibility)."""
     # Initialize browser pool for reuse
-    await _init_browser_pool()
-    
+    await init_browser_pool()
+    restart_task = asyncio.create_task(periodic_restart(interval_hours=2))
+
     try:
         # Create the aiohttp connector inside the running event loop (fixes "no running event loop")
         connector = aiohttp.TCPConnector(ssl=_SSL_CTX, limit=GLOBAL_CONCURRENCY)
@@ -1742,7 +1933,12 @@ async def main(urls):
                     manifest_file.close()
     finally:
         # Cleanup browser pool
-        await _cleanup_browser_pool()
+        await cleanup_browser_pool()
+        restart_task.cancel()
+        try:
+            await restart_task
+        except asyncio.CancelledError:
+            pass
 
 if __name__ == "__main__":
     import sys
